@@ -1,3 +1,6 @@
+import numpy as np
+import pandas as pd
+
 """
 app.py - Streamlit UI/UX Application for Unreinforced Masonry (URM) Horizontal
 Bending Capacity (Mh) Evaluation (AS 3700:2011, Griffith & Vaculik, Willis et al.)
@@ -178,6 +181,142 @@ def build_submechanism_chart(res: Dict[str, Any], h_wall_m: float) -> go.Figure:
     )
     return fig
 
+# ==============================================================================
+# 4B. PHASE 4: FAILURE MODE SWITCH & EXPORT
+# ==============================================================================
+SWEEP_CONFIG: Dict[str, Dict[str, Any]] = {
+    "Fbtm": {
+        "label": "Brick Modulus of Rupture (Fbtm)", "unit": "MPa", "min": 0.1, "max": 10.0,
+        "reason": (
+            "Increasing Fbtm directly elevates the flexural tensile resistance of the brick units (Line Failure) "
+            "while leaving mortar bed joint torsional-shear resistance (Stepped Failure) unchanged. Once brick "
+            "strength exceeds the bed joint torsional capacity, cracking bypasses the units and steps through the mortar."
+        ),
+    },
+    "fd": {
+        "label": "Vertical Compressive Stress (fd)", "unit": "MPa", "min": 0.0, "max": 5.0,
+        "reason": (
+            "Higher vertical precompression increases mortar bed joint frictional shear resistance (τb = 1.6·Ftn + 0.9·fd), "
+            "rapidly strengthening Stepped Failure capacity. Simultaneously, Poisson lateral tension (−ν·fd) slightly reduces "
+            "net brick flexural capacity, shifting the governing mechanism from Stepped Failure to Line Failure."
+        ),
+    },
+    "Ftn": {
+        "label": "Bed Joint Flexural Tensile Strength (Ftn)", "unit": "MPa", "min": 0.05, "max": 3.0,
+        "reason": (
+            "Increasing Ftn boosts the cohesive bond component of bed joint shear strength (τb), directly increasing "
+            "torsional resistance against Stepped Failure. Because Line Failure depends solely on brick strength and "
+            "vertical stress, higher Ftn forces the governing crack path to shift into the brick units (Line Failure)."
+        ),
+    },
+    "lu": {
+        "label": "Masonry Unit Length (lu)", "unit": "mm", "min": 50.0, "max": 600.0,
+        "reason": (
+            "Longer masonry units expand the bed joint overlap lever arm (lu + tj), proportionally increasing mortar joint "
+            "torsional resistance (Stepped Failure). Because unit length does not alter individual brick flexural modulus "
+            "(Line Failure), longer units drive the governing failure mode toward Line Failure."
+        ),
+    },
+    "hu": {
+        "label": "Masonry Unit Height (hu)", "unit": "mm", "min": 30.0, "max": 400.0,
+        "reason": (
+            "Taller units increase the brick section modulus ratio hu/(hu + tj), slightly raising Line Failure capacity. "
+            "Conversely, taller units reduce the number of horizontal bed joints per meter of wall height, lowering "
+            "cumulative bed joint torsional resistance and shifting the governing mechanism toward Stepped Failure."
+        ),
+    },
+    "tj": {
+        "label": "Mortar Joint Thickness (tj)", "unit": "mm", "min": 2.0, "max": 30.0,
+        "reason": (
+            "Increasing mortar joint thickness widens the torsional bed joint lever arm (lu + tj) in Stepped Failure "
+            "while scaling course frequency 1/(hu + tj) equally for both modes. Consequently, thicker mortar joints "
+            "marginally increase Stepped Failure capacity relative to Line Failure."
+        ),
+    },
+}
+
+
+def find_failure_mode_switch(inputs: Dict[str, float], param_key: str) -> Dict[str, Any]:
+    """Sweeps param_key across 150 points and interpolates the exact Line/Stepped switch."""
+    cfg = SWEEP_CONFIG[param_key]
+    x_vals = np.linspace(cfg["min"], cfg["max"], 150)
+    line_l, step_l, gv_l, as_l, wi_l = [], [], [], [], []
+
+    for val in x_vals:
+        res = calculate_all_methods({**inputs, param_key: float(val)})
+        gv_d = res["details"]["Griffith_Vaculik"]
+        line_l.append(gv_d["Mh_line_total_kNm"])
+        step_l.append(gv_d["Mh_stepped_total_kNm"])
+        gv_l.append(res["Mh_Griffith_total"])
+        as_l.append(res["Mh_AS3700_total"])
+        wi_l.append(res["Mh_Willis_total"])
+
+    line_arr, step_arr = np.array(line_l), np.array(step_l)
+    diff = line_arr - step_arr
+    crossings = np.where(np.diff(np.sign(diff)) != 0)[0]
+
+    sw_val, sw_mh = None, None
+    if len(crossings) > 0:
+        i = int(crossings[0])
+        x0, x1, y0, y1 = x_vals[i], x_vals[i + 1], diff[i], diff[i + 1]
+        sw_val = float(x0 - y0 * (x1 - x0) / (y1 - y0))
+        sw_mh = float(line_arr[i] + (sw_val - x0) / (x1 - x0) * (line_arr[i + 1] - line_arr[i]))
+
+    return {
+        "x": x_vals, "Mh_line_total_kNm": line_arr, "Mh_stepped_total_kNm": step_arr,
+        "Mh_Griffith_total": np.array(gv_l), "Mh_AS3700_total": np.array(as_l),
+        "Mh_Willis_total": np.array(wi_l), "switch_value": sw_val, "switch_Mh_kNm": sw_mh,
+    }
+
+
+def render_phase4_tab(inputs: Dict[str, float], results: Dict[str, Any]) -> None:
+    """Renders Tab 3: Failure mode switch analysis, transition plot, and CSV exports."""
+    param_key = st.selectbox(
+        "🔎 Select Design Parameter to Sweep for Failure Mode Transition:",
+        options=list(SWEEP_CONFIG.keys()),
+        format_func=lambda k: f"{SWEEP_CONFIG[k]['label']} [{SWEEP_CONFIG[k]['unit']}]",
+    )
+    cfg = SWEEP_CONFIG[param_key]
+    unit = cfg["unit"]
+    sweep = find_failure_mode_switch(inputs, param_key)
+
+    cur_val = inputs[param_key]
+    cur_mode = results["Griffith_governing_mode"]
+    cur_mh = results["Mh_Griffith_total"]
+    sw_val, sw_mh = sweep["switch_value"], sweep["switch_Mh_kNm"]
+    target_mode = "Stepped" if cur_mode == "Line" else "Line"
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"Current {param_key} & Mode", f"{cur_val:.2f} {unit}", f"Governing: {cur_mode} Failure", delta_color="off")
+    if sw_val is not None and sw_mh is not None:
+        m2.metric("Exact Switch Threshold", f"{sw_val:.3f} {unit}", f"Transition Mh: {sw_mh:.2f} kNm", delta_color="off")
+        m3.metric(f"Required Change (Δ{param_key})", f"{sw_val - cur_val:+.3f} {unit}", f"Flips to {target_mode} Failure")
+    else:
+        m2.metric("Exact Switch Threshold", "No Switch in Range", f"Tested {cfg['min']}–{cfg['max']} {unit}", delta_color="off")
+        m3.metric(f"Required Change (Δ{param_key})", "N/A", f"{cur_mode} governs across full range", delta_color="off")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sweep["x"], y=sweep["Mh_line_total_kNm"], name="Line Failure (Mh,line)", line=dict(color="#ef4444", width=2.5, dash="dash")))
+    fig.add_trace(go.Scatter(x=sweep["x"], y=sweep["Mh_stepped_total_kNm"], name="Stepped Failure (Mh,step)", line=dict(color="#0d9488", width=2.5, dash="dash")))
+    fig.add_trace(go.Scatter(x=sweep["x"], y=sweep["Mh_Griffith_total"], name="Governing Griffith Mh", line=dict(color="#1e293b", width=4)))
+    fig.add_trace(go.Scatter(x=[cur_val], y=[cur_mh], mode="markers", name="Current Operating Point", marker=dict(size=12, color="#f59e0b", symbol="diamond", line=dict(width=2, color="#1e293b"))))
+
+    if sw_val is not None and sw_mh is not None:
+        fig.add_vline(x=sw_val, line_dash="dot", line_color="#7c3aed", line_width=2, annotation_text=f"Switch: {sw_val:.2f} {unit} ({sw_mh:.2f} kNm)", annotation_position="top left")
+
+    fig.update_layout(title=f"Failure Mode Transition Curve vs. {cfg['label']}", xaxis_title=f"{cfg['label']} ({unit})", yaxis_title="Total Wall Capacity Mh (kNm)", template="plotly_white", height=420, margin=dict(l=20, r=20, t=50, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(f"<div class='mode-card mode-card-stepped'><b>🔬 Physical Engineering Reason ({cfg['label']}):</b><br>{cfg['reason']}</div>", unsafe_allow_html=True)
+    st.caption("Governing Analytical Equilibrium Condition ($M_{h,\\text{line}} = M_{h,\\text{step}}$):")
+    st.latex(r"\frac{1}{12}(F_{btm} - \nu f_d) h_u = 0.5 \tau_b K_b (l_u + t_j)")
+
+    summary_df = pd.DataFrame([{**inputs, "Mh_AS3700_kNm": results["Mh_AS3700_total"], "Mh_Griffith_kNm": cur_mh, "Griffith_Mode": cur_mode, "Mh_Willis_kNm": results["Mh_Willis_total"], "Switch_Param": param_key, "Switch_Threshold": sw_val}])
+    sweep_df = pd.DataFrame({param_key: sweep["x"], "Mh_line_kNm": sweep["Mh_line_total_kNm"], "Mh_stepped_kNm": sweep["Mh_stepped_total_kNm"], "Mh_Griffith_kNm": sweep["Mh_Griffith_total"], "Mh_AS3700_kNm": sweep["Mh_AS3700_total"], "Mh_Willis_kNm": sweep["Mh_Willis_total"]})
+
+    d1, d2 = st.columns(2)
+    d1.download_button("📥 Download Current Wall Summary (CSV)", data=summary_df.to_csv(index=False).encode("utf-8"), file_name="urm_mh_summary.csv", mime="text/csv", use_container_width=True)
+    d2.download_button(f"📈 Download {param_key} Sensitivity Sweep (CSV)", data=sweep_df.to_csv(index=False).encode("utf-8"), file_name=f"urm_sweep_{param_key}.csv", mime="text/csv", use_container_width=True)
 
 # ==============================================================================
 # 5. MAIN APPLICATION WORKSPACE
@@ -234,7 +373,7 @@ def main() -> None:
         )
 
     st.write("")
-    tab1, tab2 = st.tabs(["📊 Comparative Capacity Visuals", "🧮 Detailed Engineering Breakdown"])
+    tab1, tab2, tab3 = st.tabs(["📊 Comparative Capacity Visuals", "🧮 Detailed Engineering Breakdown", "🔄 Failure Mode Switch & Export"])
 
     with tab1:
         c_left, c_right = st.columns(2)
@@ -292,7 +431,10 @@ def main() -> None:
                 f"- **Unit Moment ($M_u$):** `{wi_d['Mu_kNm']:.4f} kNm`\n"
                 f"- **Total Wall $M_h$:** **`{wi_d['Mh_Willis_total_kNm']:.3f} kNm`**"
             )
+    with tab3:
+        render_phase4_tab(inputs, results)        
 
 
 if __name__ == "__main__":
     main()
+

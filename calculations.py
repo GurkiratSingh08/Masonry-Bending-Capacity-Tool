@@ -394,27 +394,3 @@ def calculate_all_methods(
         },
     }
 
-# --- QUICK TEST BLOCK ---
-if __name__ == "__main__":
-    test_inputs = {
-        "Hwall": 3000,      # 3m wall height
-        "Sp": 115,          # overlap
-        "tu": 110,          # brick thickness
-        "hu": 76,           # brick height
-        "lu": 230,          # brick length
-        "tj": 10,           # mortar thickness
-        "Fbtm": 1.5,        # brick tensile strength
-        "Ftn": 0.2,         # bed joint tensile strength
-        "fd": 0.5,          # vertical compression
-        "nu_poisson": 0.2   # Poisson's ratio
-    }
-    
-    try:
-        results = calculate_all_methods(test_inputs)
-        print("✅ Backend Engine is Working!")
-        print(f"AS 3700:      {results['Mh_AS3700_total']:.2f} kNm")
-        print(f"Willis:       {results['Mh_Willis_total']:.2f} kNm")
-        print(f"Griffith:     {results['Mh_Griffith_total']:.2f} kNm")
-        print(f"Failure Mode: {results['Griffith_governing_mode']}")
-    except Exception as e:
-        print(f"❌ Error: {e}")
